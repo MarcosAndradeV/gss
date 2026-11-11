@@ -126,7 +126,7 @@ fn test_fmt_version() {
         .expect("failed to execute gss-fmt");
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("gss-fmt 0.1.0"));
+    assert!(stdout.contains(&format!("gss-fmt {}", env!("CARGO_PKG_VERSION"))));
 }
 
 #[test]

@@ -274,11 +274,9 @@ pub fn run() {
                     }
 
                     if write_in_place {
-                        if is_unformatted {
-                            if let Err(err) = fs::write(&file_path, &formatted) {
-                                eprintln!("Error writing {display_name}: {err}");
-                                has_error = true;
-                            }
+                        if is_unformatted && let Err(err) = fs::write(&file_path, &formatted) {
+                            eprintln!("Error writing {display_name}: {err}");
+                            has_error = true;
                         }
                     } else if !check_only && !show_diff {
                         write_stdout(&formatted);
@@ -300,10 +298,8 @@ pub fn run() {
             }
             process::exit(1);
         }
-    } else if show_diff && !write_in_place {
-        if !unformatted_files.is_empty() {
-            process::exit(1);
-        }
+    } else if show_diff && !write_in_place && !unformatted_files.is_empty() {
+        process::exit(1);
     }
 
     if has_error {

@@ -9,6 +9,12 @@ use lex_just_parse::try_parse;
 
 pub mod diff;
 pub use diff::unified_diff;
+pub mod query;
+pub use query::*;
+#[cfg(feature = "watch")]
+pub mod watch;
+#[cfg(feature = "watch")]
+pub use watch::*;
 #[cfg(feature = "lazy")]
 pub mod lazy;
 
@@ -176,10 +182,8 @@ impl FromGssValue for f32 {
             Some(*x)
         } else if let Some(x) = value.as_number() {
             Some(*x as f32)
-        } else if let Some(x) = value.as_signed_number() {
-            Some(*x as f32)
         } else {
-            None
+            value.as_signed_number().map(|x| *x as f32)
         }
     }
 }
@@ -192,10 +196,8 @@ impl FromGssValue for f64 {
             Some(*x as f64)
         } else if let Some(x) = value.as_signed_number() {
             Some(*x as f64)
-        } else if let Some(x) = value.downcast_ref::<f64>() {
-            Some(*x)
         } else {
-            None
+            value.downcast_ref::<f64>().copied()
         }
     }
 }
@@ -303,6 +305,12 @@ impl Object {
 
     pub fn allow_redefinition(&self) -> bool {
         self.allow_redefinition
+    }
+}
+
+impl Default for Object {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -577,10 +585,12 @@ impl Object {
         let mut obj = self;
         if let Some((last, prefix)) = path.split_last() {
             for c in prefix {
-                if let Some(v) = obj.inner.get(*c) {
+                {
+                    let v = obj.inner.get(*c)?;
                     if let Some(o) = v.as_object() {
                         obj = o;
-                    } else if let Some(expr) = v.as_expr() {
+                    } else {
+                        let expr = v.as_expr()?;
                         obj = match expr {
                             Expr::Symbol(s) => {
                                 let val = self.get_value_impl(
@@ -603,11 +613,7 @@ impl Object {
                                 val.as_object()?
                             }
                         };
-                    } else {
-                        return None;
                     }
-                } else {
-                    return None;
                 }
             }
 
@@ -874,7 +880,7 @@ fn parse<'lex, P: AsRef<Path>>(
     }
 }
 
-fn parse_gss<'lex>(mut lex: RefLexer, allow_redefinition: bool) -> Parser<Gss, Box<dyn StdError>> {
+fn parse_gss(mut lex: RefLexer, allow_redefinition: bool) -> Parser<Gss, Box<dyn StdError>> {
     let mut object = Object::new();
     object.set_allow_redefinition(allow_redefinition);
     if lex.peek().kind == TokenKind::EOF {
@@ -903,10 +909,7 @@ fn parse_gss<'lex>(mut lex: RefLexer, allow_redefinition: bool) -> Parser<Gss, B
     Parser::Success(lex, object)
 }
 
-fn parse_object<'lex>(
-    mut lex: RefLexer,
-    allow_redefinition: bool,
-) -> Parser<Object, Box<dyn StdError>> {
+fn parse_object(mut lex: RefLexer, allow_redefinition: bool) -> Parser<Object, Box<dyn StdError>> {
     let mut object = Object::new();
     object.set_allow_redefinition(allow_redefinition);
     if lex.peek().kind == TokenKind::OpenCurly {
@@ -940,7 +943,7 @@ fn parse_object<'lex>(
     Parser::Success(lex, object)
 }
 
-fn parse_list<'lex>(
+fn parse_list(
     mut lex: RefLexer,
     allow_redefinition: bool,
 ) -> Parser<Vec<Value>, Box<dyn StdError>> {
@@ -967,10 +970,7 @@ fn parse_list<'lex>(
     Parser::Success(lex, items)
 }
 
-fn parse_value<'lex>(
-    mut lex: RefLexer,
-    allow_redefinition: bool,
-) -> Parser<Value, Box<dyn StdError>> {
+fn parse_value(mut lex: RefLexer, allow_redefinition: bool) -> Parser<Value, Box<dyn StdError>> {
     if lex.peek().kind == TokenKind::OpenBracket {
         let list = try_parse!(lex, parse_list(lex, allow_redefinition));
         return Parser::Success(lex, Value::Vec(list));
@@ -999,7 +999,7 @@ fn parse_value<'lex>(
             if lex.peek().kind == TokenKind::Mod {
                 lex.next();
                 return Parser::Success(lex, {
-                    let x = x as f32 / 100.;
+                    let x = x / 100.;
                     Value::Float(x)
                 });
             }
@@ -1132,7 +1132,7 @@ fn parse_value<'lex>(
 
 macro_rules! make_expect {
     ($name:ident, $kind:expr, $repr:literal) => {
-        fn $name<'lex>(lex: RefLexer) -> Parser<(), Box<dyn StdError>> {
+        fn $name(lex: RefLexer) -> Parser<(), Box<dyn StdError>> {
             let actual = lex.peek().kind;
             if actual != $kind {
                 return Parser::Fail(lex, format!("Expect {} got {actual:?}", $repr).into());
@@ -1142,7 +1142,7 @@ macro_rules! make_expect {
         }
     };
     (ret, $name:ident, $kind:expr, $repr:literal) => {
-        fn $name<'lex>(lex: RefLexer) -> Parser<Token, Box<dyn StdError>> {
+        fn $name(lex: RefLexer) -> Parser<Token, Box<dyn StdError>> {
             let actual = lex.peek().kind;
             if actual != $kind {
                 return Parser::Fail(lex, format!("Expect {} got {actual:?}", $repr).into());
@@ -1163,7 +1163,7 @@ make_expect! {parse_close_curly, TokenKind::CloseCurly, "}" }
 make_expect! {parse_eof, TokenKind::EOF, "EOF" }
 make_expect! {ret, parse_ident, TokenKind::Identifier, "identifier" }
 
-fn parse_maybe_comma<'lex>(lex: RefLexer) -> Parser<(), Box<dyn StdError>> {
+fn parse_maybe_comma(lex: RefLexer) -> Parser<(), Box<dyn StdError>> {
     if lex.peek().kind == TokenKind::Comma {
         return parse_comma(lex);
     }
@@ -1861,27 +1861,54 @@ mod tests {
         assert_eq!(ToGssValue::to_gss_value(&0i8), Value::SignedNumber(0));
         assert_eq!(ToGssValue::to_gss_value(&42i8), Value::SignedNumber(42));
         assert_eq!(ToGssValue::to_gss_value(&(-42i8)), Value::SignedNumber(-42));
-        assert_eq!(ToGssValue::to_gss_value(&i8::MIN), Value::SignedNumber(-128));
+        assert_eq!(
+            ToGssValue::to_gss_value(&i8::MIN),
+            Value::SignedNumber(-128)
+        );
         assert_eq!(ToGssValue::to_gss_value(&i8::MAX), Value::SignedNumber(127));
 
         assert_eq!(ToGssValue::to_gss_value(&0i16), Value::SignedNumber(0));
-        assert_eq!(ToGssValue::to_gss_value(&1000i16), Value::SignedNumber(1000));
-        assert_eq!(ToGssValue::to_gss_value(&(-1000i16)), Value::SignedNumber(-1000));
+        assert_eq!(
+            ToGssValue::to_gss_value(&1000i16),
+            Value::SignedNumber(1000)
+        );
+        assert_eq!(
+            ToGssValue::to_gss_value(&(-1000i16)),
+            Value::SignedNumber(-1000)
+        );
 
         assert_eq!(ToGssValue::to_gss_value(&0i32), Value::SignedNumber(0));
         assert_eq!(ToGssValue::to_gss_value(&42i32), Value::SignedNumber(42));
-        assert_eq!(ToGssValue::to_gss_value(&(-42i32)), Value::SignedNumber(-42));
-        assert_eq!(ToGssValue::to_gss_value(&i32::MIN), Value::SignedNumber(i32::MIN));
-        assert_eq!(ToGssValue::to_gss_value(&i32::MAX), Value::SignedNumber(i32::MAX));
+        assert_eq!(
+            ToGssValue::to_gss_value(&(-42i32)),
+            Value::SignedNumber(-42)
+        );
+        assert_eq!(
+            ToGssValue::to_gss_value(&i32::MIN),
+            Value::SignedNumber(i32::MIN)
+        );
+        assert_eq!(
+            ToGssValue::to_gss_value(&i32::MAX),
+            Value::SignedNumber(i32::MAX)
+        );
 
         assert_eq!(ToGssValue::to_gss_value(&0i64), Value::SignedNumber(0));
-        assert_eq!(ToGssValue::to_gss_value(&(-123456i64)), Value::SignedNumber(-123456));
+        assert_eq!(
+            ToGssValue::to_gss_value(&(-123456i64)),
+            Value::SignedNumber(-123456)
+        );
 
         assert_eq!(ToGssValue::to_gss_value(&0i128), Value::SignedNumber(0));
-        assert_eq!(ToGssValue::to_gss_value(&(-78910i128)), Value::SignedNumber(-78910));
+        assert_eq!(
+            ToGssValue::to_gss_value(&(-78910i128)),
+            Value::SignedNumber(-78910)
+        );
 
         assert_eq!(ToGssValue::to_gss_value(&0isize), Value::SignedNumber(0));
-        assert_eq!(ToGssValue::to_gss_value(&(-1024isize)), Value::SignedNumber(-1024));
+        assert_eq!(
+            ToGssValue::to_gss_value(&(-1024isize)),
+            Value::SignedNumber(-1024)
+        );
     }
 
     #[test]
@@ -1892,7 +1919,10 @@ mod tests {
 
         assert_eq!(ToGssValue::to_gss_value(&0.0f64), Value::Float(0.0));
         assert_eq!(ToGssValue::to_gss_value(&2.5f64), Value::Float(2.5f32));
-        assert_eq!(ToGssValue::to_gss_value(&(-42.5f64)), Value::Float(-42.5f32));
+        assert_eq!(
+            ToGssValue::to_gss_value(&(-42.5f64)),
+            Value::Float(-42.5f32)
+        );
     }
 
     #[test]
@@ -1904,7 +1934,10 @@ mod tests {
     #[test]
     fn test_to_gss_value_string() {
         let empty = String::new();
-        assert_eq!(ToGssValue::to_gss_value(&empty), Value::String(String::new()));
+        assert_eq!(
+            ToGssValue::to_gss_value(&empty),
+            Value::String(String::new())
+        );
 
         let text = "Hello GSS".to_string();
         assert_eq!(
@@ -1944,7 +1977,10 @@ mod tests {
         assert_eq!(to_val(&(-50i32)), Value::SignedNumber(-50));
         assert_eq!(to_val(&12.5f32), Value::Float(12.5));
         assert_eq!(to_val(&true), Value::Bool(true));
-        assert_eq!(to_val(&"test".to_string()), Value::String("test".to_string()));
+        assert_eq!(
+            to_val(&"test".to_string()),
+            Value::String("test".to_string())
+        );
     }
 
     #[test]
@@ -1975,7 +2011,11 @@ mod tests {
         assert_eq!(String::from_gss_value(&gss_val), Some(orig_str));
 
         // Vec<Value> roundtrip
-        let orig_vec = vec![Value::Number(1), Value::SignedNumber(-1), Value::Bool(false)];
+        let orig_vec = vec![
+            Value::Number(1),
+            Value::SignedNumber(-1),
+            Value::Bool(false),
+        ];
         let gss_val = ToGssValue::to_gss_value(&orig_vec);
         assert_eq!(Vec::<Value>::from_gss_value(&gss_val), Some(orig_vec));
     }
